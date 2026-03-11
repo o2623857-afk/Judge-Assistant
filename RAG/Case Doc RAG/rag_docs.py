@@ -411,27 +411,91 @@ def retrieve(state: AgentState):
     print("Entering retrieve")
 
     query = state.get("refined_query", "")
-    doc_target = state.get("selected_doc_id", None)  
-    print(f"retrieve: refined_query={query},\n doc_target={doc_target}")
+    doc_target = state.get("selected_doc_id", None)
+    case_id = state.get("case_id", "")
+    print(f"retrieve: refined_query={query},\n doc_target={doc_target}, case_id={case_id}")
 
     # 2. Judge asked for info FROM a specific document
     if doc_target and state.get("doc_selection_mode") == "restrict_to_doc":
         print(f"retrieve: Judge requested info FROM document: {doc_target}")
 
+        # Build the metadata filter -- always include the doc type and
+        # optionally scope to the current case when a case_id is available.
+        meta_filter = {"type": doc_target}
+        if case_id:
+            meta_filter = {
+                "$and": [
+                    {"type": doc_target},
+                    {"case_id": case_id},
+                ]
+            }
+
         filtered_retriever = db.as_retriever(
             search_type="mmr",
             search_kwargs={
                 "k": 5,
-                "filter": {"type": doc_target},
+                "filter": meta_filter,
             },
         )
         docs = filtered_retriever.invoke(query)
+        print(f"retrieve: filtered retrieval returned {len(docs)} doc(s)")
+
+        # Fallback 1: drop case_id filter and retry with doc type only
+        if not docs and case_id:
+            print("retrieve: retrying without case_id filter")
+            fallback_retriever = db.as_retriever(
+                search_type="mmr",
+                search_kwargs={
+                    "k": 5,
+                    "filter": {"type": doc_target},
+                },
+            )
+            docs = fallback_retriever.invoke(query)
+            print(f"retrieve: type-only filter returned {len(docs)} doc(s)")
+
+        # Fallback 2: try matching on 'title' metadata instead of 'type'
+        if not docs:
+            print("retrieve: retrying with 'title' metadata key instead of 'type'")
+            title_retriever = db.as_retriever(
+                search_type="mmr",
+                search_kwargs={
+                    "k": 5,
+                    "filter": {"title": doc_target},
+                },
+            )
+            docs = title_retriever.invoke(query)
+            print(f"retrieve: title filter returned {len(docs)} doc(s)")
+
+        # Fallback 3: unfiltered retrieval as last resort
+        if not docs:
+            print("retrieve: all filtered retrievals returned 0 docs, falling back to unfiltered retrieval")
+            docs = retriever.invoke(query)
+            print(f"retrieve: unfiltered retrieval returned {len(docs)} doc(s)")
+
         state["retrieved_docs"] = docs
         return state
 
     # 3. Normal retrieval (no document mentioned)
     print("retrieve: No specific document requested. Running generic retrieval.")
-    docs = retriever.invoke(query)
+    if case_id:
+        case_retriever = db.as_retriever(
+            search_type="mmr",
+            search_kwargs={
+                "k": 5,
+                "filter": {"case_id": case_id},
+            },
+        )
+        docs = case_retriever.invoke(query)
+        print(f"retrieve: case-filtered retrieval returned {len(docs)} doc(s)")
+        # Fall back to unfiltered if case filter yields nothing
+        if not docs:
+            print("retrieve: case filter returned 0 docs, falling back to unfiltered")
+            docs = retriever.invoke(query)
+            print(f"retrieve: unfiltered retrieval returned {len(docs)} doc(s)")
+    else:
+        docs = retriever.invoke(query)
+        print(f"retrieve: unfiltered retrieval returned {len(docs)} doc(s)")
+
     state["retrieved_docs"] = docs
 
     return state
@@ -439,12 +503,26 @@ def retrieve(state: AgentState):
 
 def retriveGrader(state: AgentState):
     print(f"Entering retriveGrader")
-    system = """You are a strict grader assessing the relevance of a retrieved legal document to a judge's question.
+
+    docs = state.get("retrieved_docs", [])
+    print(f"retrieval_grader: received {len(docs)} doc(s) to grade")
+
+    # If retrieval returned nothing there is nothing to grade -- skip the
+    # LLM calls entirely and let the proceed_router handle the empty case.
+    if not docs:
+        print("retrieval_grader: no documents to grade (retrieval returned empty)")
+        state["proceedToGenerate"] = False
+        print(f"retrieval_grader: proccedToGenerate = {state['proceedToGenerate']}")
+        return state
+
+    system = """You are a grader assessing the relevance of a retrieved legal document to a judge's question.
     
     The documents are from Egyptian Civil Law cases (Statement of Claims, Expert Reports, Court Rulings).
+    The documents are written in Arabic. The judge's question is also in Arabic.
     
-    If the document contains keywords, facts, or legal references related to the user question, grade it as 'Yes'.
-    If the document is completely unrelated to the question, grade it as 'No'.
+    If the document contains keywords, facts, names, dates, or legal references 
+    that could help answer the judge's question, grade it as 'Yes'.
+    Only grade 'No' if the document is completely unrelated to the question.
     
     Give a binary score 'Yes' or 'No'."""  
 
@@ -452,7 +530,6 @@ def retriveGrader(state: AgentState):
     structuredLLM = llm.with_structured_output(GradeDocument)
     
     relevant_docs = []
-    docs = state.get("retrieved_docs", [])
     for doc in docs:
         human_message = HumanMessage(
             content=f"User question: {state.get('refined_query','')}\n\nRetrieved document:\n{doc.page_content}"
@@ -461,7 +538,7 @@ def retriveGrader(state: AgentState):
         grader_llm = grade_prompt | structuredLLM
         result = grader_llm.invoke({})
         print(
-            f"Grading document: {doc.page_content[:30]}... Result: {result.score.strip()}"
+            f"Grading document: {doc.page_content[:50]}... Result: {result.score.strip()}"
         )
         if result.score.strip().lower() == "yes":
             relevant_docs.append(doc)
@@ -470,7 +547,7 @@ def retriveGrader(state: AgentState):
         state["proceedToGenerate"] = True
     else:
         state["proceedToGenerate"] = False
-    print(f"retrieval_grader: proccedToGenerate = {state['proceedToGenerate']}")
+    print(f"retrieval_grader: proccedToGenerate = {state['proceedToGenerate']} ({len(relevant_docs)}/{len(docs)} relevant)")
     return state
 
 
